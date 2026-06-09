@@ -75,6 +75,15 @@ def load_company_years(ticker: str) -> tuple[YearData, YearData]:
                             inc_periods, bal_periods, cfs_periods, period=0)
     prior = _extract_year(ticker, inc_df, bal_df, cfs_df,
                           inc_periods, bal_periods, cfs_periods, period=1)
+
+    # Live market cap for Altman X4 (not in SEC filings — needs real-time price)
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        current.market_cap = float(info.get("marketCap") or 0)
+    except Exception:
+        pass  # stays 0.0 — Altman Z-Score will be understated without it
+
     return current, prior
 
 
