@@ -1,0 +1,9 @@
+{
+  "asset": "ADA",
+  "action": "buy",
+  "position_pct": 3.0,
+  "venue": "simulated",
+  "leverage": 1.0,
+  "rationale": "Piotroski F-Score 7/9, Altman Z-Score in safe zone, Sloan accruals clean. No red flags from forensic screens. Recommend position within limit.",
+  "strategy_license_id": null
+}

@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "allowed_assets": ["BTC", "ETH", "ADA"],
+  "blocked_assets": [],
+  "max_position_pct": 5.0,
+  "max_daily_loss_pct": 2.0,
+  "max_drawdown_pct": 10.0,
+  "allow_leverage": false,
+  "max_leverage": 1.0,
+  "allowed_venues": ["simulated"],
+  "blocked_venues": [],
+  "requires_user_approval": true,
+  "strategy_license_required": false
+}
