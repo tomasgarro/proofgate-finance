@@ -1,37 +1,34 @@
 """
-EDGAR ingestion via edgartools.
+EDGAR ingestion via edgartools 5.x.
 
-Fetches two consecutive 10-K filings for a company and maps their financial
+Fetches two consecutive 10-K fiscal years for a company and maps their financial
 statement line items to the input dataclasses used by our metrics engine.
-
-Usage:
-    from src.ingestion.edgar import load_company_years, set_edgar_identity
-    set_edgar_identity("Your Name your@email.com")
-    current, prior = load_company_years("AAPL")
-    # current and prior are YearData instances ready for metric calculations
 """
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
+
+
+# Only columns that start with a 4-digit year are actual period columns.
+# All other columns (concept, label, dimension, is_breakdown, etc.) are metadata.
+_DATE_COL = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 @dataclass
 class YearData:
     """Financial line items for a single fiscal year, normalized for metric inputs."""
     ticker: str
-    period: str  # e.g. "2024"
-    # Income statement
+    period: str
     sales: float
     cogs: float
     sga: float
     net_income: float
     ebit: float
-    # Cash flows
     operating_cash_flow: float
     investing_cash_flow: float
     depreciation: float
-    # Balance sheet
     receivables: float
     current_assets: float
     current_liabilities: float
@@ -40,17 +37,11 @@ class YearData:
     total_liabilities: float
     long_term_debt: float
     retained_earnings: float
-    # Market data (may be 0 if unavailable)
     market_cap: float
     shares_outstanding: float
 
 
 def set_edgar_identity(identity: str) -> None:
-    """
-    Set the SEC identity string required by EDGAR.
-    Format: "Your Name your@email.com"
-    The SEC requires this in the User-Agent header.
-    """
     try:
         from edgar import set_identity
         set_identity(identity)
@@ -60,14 +51,13 @@ def set_edgar_identity(identity: str) -> None:
 
 def load_company_years(ticker: str) -> tuple[YearData, YearData]:
     """
-    Load the two most recent fiscal year data for a ticker from SEC EDGAR.
-
+    Load the two most recent fiscal years for a ticker from SEC EDGAR.
     Returns (current_year, prior_year) as YearData objects.
-    Requires SEC_IDENTITY env var or prior call to set_edgar_identity().
     """
     identity = os.environ.get("SEC_IDENTITY")
-    if identity:
-        set_edgar_identity(identity)
+    if not identity:
+        raise EnvironmentError("User-Agent identity is not set. Add SEC_IDENTITY to your .env file.")
+    set_edgar_identity(identity)
 
     try:
         from edgar import Company
@@ -75,96 +65,124 @@ def load_company_years(ticker: str) -> tuple[YearData, YearData]:
         raise ImportError("edgartools is required: pip install edgartools")
 
     company = Company(ticker)
-    financials = company.get_financials()
+    fin = company.get_financials()
 
-    current = _extract_year(ticker, financials, period=0)
-    prior = _extract_year(ticker, financials, period=1)
+    inc_df, inc_periods = _stmt_df(fin, "income_statement")
+    bal_df, bal_periods = _stmt_df(fin, "balance_sheet")
+    cfs_df, cfs_periods = _stmt_df(fin, "cash_flow_statement")
+
+    current = _extract_year(ticker, inc_df, bal_df, cfs_df,
+                            inc_periods, bal_periods, cfs_periods, period=0)
+    prior = _extract_year(ticker, inc_df, bal_df, cfs_df,
+                          inc_periods, bal_periods, cfs_periods, period=1)
     return current, prior
 
 
-def _extract_year(ticker: str, financials, period: int) -> YearData:
-    """
-    Extract a single year's data from a Financials object.
+# ── Statement helpers ─────────────────────────────────────────────────────────
 
-    period=0 means most recent, period=1 means prior year.
-    Uses fuzzy label matching with common XBRL tag aliases.
-    """
-    inc = _get_statement(financials, "income")
-    bal = _get_statement(financials, "balance")
-    cfs = _get_statement(financials, "cashflow")
+def _stmt_df(fin, method_name: str):
+    """Call a Statement method and return (DataFrame, [period_col_names])."""
+    method = getattr(fin, method_name, None)
+    if not callable(method):
+        return None, []
+    try:
+        stmt = method()
+        if hasattr(stmt, "to_dataframe"):
+            df = stmt.to_dataframe()
+            # Only columns matching YYYY-MM-DD... are real period columns
+            period_cols = [c for c in df.columns if _DATE_COL.match(str(c))]
+            return df, period_cols
+    except Exception:
+        pass
+    return None, []
 
-    period_label = _get_period_label(inc, period)
 
-    def g(stmt, *aliases) -> float:
-        return _get_value(stmt, period, *aliases)
+def _extract_year(ticker, inc_df, bal_df, cfs_df,
+                  inc_periods, bal_periods, cfs_periods, period: int) -> YearData:
 
-    sales = g(inc,
-        "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueNet", "RevenueFromContractWithCustomer", "Revenue")
+    def gi(*aliases): return _get(inc_df, inc_periods, period, *aliases)
+    def gb(*aliases): return _get(bal_df, bal_periods, period, *aliases)
+    def gc(*aliases): return _get(cfs_df, cfs_periods, period, *aliases)
 
-    cogs = g(inc,
+    label = _year_label(inc_periods, period)
+
+    sales = gi(
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues", "SalesRevenueNet", "RevenueFromContractWithCustomer",
+        "Net sales", "Total net revenue", "Revenue",
+    )
+    cogs = gi(
         "CostOfGoodsAndServicesSold", "CostOfRevenue",
-        "CostOfGoodsSold", "CostOfSales")
-
-    sga = g(inc,
+        "CostOfGoodsSold", "CostOfSales",
+        "Cost of sales", "Cost of revenue",
+    )
+    sga = gi(
         "SellingGeneralAndAdministrativeExpense",
-        "SellingAndMarketingExpense", "GeneralAndAdministrativeExpense")
-
-    net_income = g(inc,
-        "NetIncomeLoss", "NetIncome", "ProfitLoss")
-
-    ebit = g(inc,
-        "OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest")
-
-    operating_cash_flow = g(cfs,
+        "SellingAndMarketingExpense", "GeneralAndAdministrativeExpense",
+        "Selling, general and administrative",
+    )
+    net_income = gi(
+        "NetIncomeLoss", "NetIncome", "ProfitLoss",
+        "Net income",
+    )
+    ebit = gi(
+        "OperatingIncomeLoss",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "Operating income",
+    )
+    operating_cash_flow = gc(
         "NetCashProvidedByUsedInOperatingActivities",
-        "CashGeneratedFromOperations")
-
-    investing_cash_flow = g(cfs,
+        "CashGeneratedFromOperations",
+        "Operating activities",
+    )
+    investing_cash_flow = gc(
         "NetCashProvidedByUsedInInvestingActivities",
-        "CashUsedInInvestingActivities")
-
-    depreciation = g(cfs,
+        "CashUsedInInvestingActivities",
+        "Investing activities",
+    )
+    depreciation = gc(
         "DepreciationDepletionAndAmortization",
         "DepreciationAmortizationAndAccretionNet",
-        "Depreciation")
-
-    receivables = g(bal,
+        "Depreciation and amortization", "Depreciation",
+    )
+    receivables = gb(
         "AccountsReceivableNetCurrent", "ReceivablesNetCurrent",
-        "AccountsReceivable")
-
-    current_assets = g(bal,
-        "AssetsCurrent", "TotalCurrentAssets")
-
-    current_liabilities = g(bal,
-        "LiabilitiesCurrent", "TotalCurrentLiabilities")
-
-    ppe_net = g(bal,
-        "PropertyPlantAndEquipmentNet", "PropertyAndEquipmentNet")
-
-    total_assets = g(bal,
-        "Assets", "TotalAssets")
-
-    total_liabilities = g(bal,
-        "Liabilities", "TotalLiabilities")
-
-    long_term_debt = g(bal,
+        "Accounts receivable, net", "Accounts receivable",
+    )
+    current_assets = gb(
+        "AssetsCurrent", "Total current assets",
+    )
+    current_liabilities = gb(
+        "LiabilitiesCurrent", "Total current liabilities",
+    )
+    ppe_net = gb(
+        "PropertyPlantAndEquipmentNet", "PropertyAndEquipmentNet",
+        "Property, plant and equipment, net",
+        "Property and equipment, net",
+    )
+    total_assets = gb(
+        "Assets", "Total assets",
+    )
+    total_liabilities = gb(
+        "Liabilities", "Total liabilities",
+    )
+    long_term_debt = gb(
         "LongTermDebtNoncurrent", "LongTermDebt",
-        "LongTermDebtAndCapitalLeaseObligations")
-
-    retained_earnings = g(bal,
-        "RetainedEarningsAccumulatedDeficit", "RetainedEarnings")
-
-    shares = g(bal,
-        "CommonStockSharesOutstanding", "SharesOutstanding")
-
-    # Market cap: not in filings, would need real-time price × shares
-    # Pass 0 — caller can override with live data if needed
-    market_cap = 0.0
+        "LongTermDebtAndCapitalLeaseObligations",
+        "Term debt, non-current", "Long-term debt",
+    )
+    retained_earnings = gb(
+        "RetainedEarningsAccumulatedDeficit", "RetainedEarnings",
+        "Retained earnings",
+    )
+    shares = gb(
+        "CommonStockSharesOutstanding", "SharesOutstanding",
+        "Common shares outstanding",
+    )
 
     return YearData(
         ticker=ticker,
-        period=period_label or str(period),
+        period=label,
         sales=sales, cogs=cogs, sga=sga,
         net_income=net_income, ebit=ebit,
         operating_cash_flow=operating_cash_flow,
@@ -178,86 +196,81 @@ def _extract_year(ticker: str, financials, period: int) -> YearData:
         total_liabilities=total_liabilities,
         long_term_debt=long_term_debt,
         retained_earnings=retained_earnings,
-        market_cap=market_cap,
+        market_cap=0.0,
         shares_outstanding=shares,
     )
 
 
-def _get_statement(financials, kind: str):
-    """Try multiple attribute names for different edgartools versions."""
-    candidates = {
-        "income": ["income_statement", "income", "income_statements"],
-        "balance": ["balance_sheet", "balance", "balance_sheets"],
-        "cashflow": ["cash_flow_statement", "cashflow", "cash_flow", "cash_flow_statements"],
-    }
-    for name in candidates.get(kind, []):
-        stmt = getattr(financials, name, None)
-        if stmt is not None:
-            return stmt
-    return None
-
-
-def _get_period_label(stmt, period: int) -> Optional[str]:
-    """Try to get a human-readable period label (year string) for a column."""
-    if stmt is None:
-        return None
-    try:
-        import pandas as pd
-        if hasattr(stmt, "columns"):
-            cols = list(stmt.columns)
-            if period < len(cols):
-                return str(cols[period])
-    except Exception:
-        pass
-    return None
-
-
-def _get_value(stmt, period: int, *aliases) -> float:
+def _get(df, period_cols: list, period: int, *aliases) -> float:
     """
-    Try each alias against the statement until one returns a non-zero value.
-    Handles both pandas DataFrame and dict-like statement objects.
+    Look up a value in a statement DataFrame by concept/label aliases.
+
+    Concepts are stored with namespace prefixes like 'us-gaap_NetIncomeLoss'.
+    We strip the prefix before matching so callers can use bare XBRL names.
+    We also iterate through ALL matching rows (not just the first) to skip NaN
+    header/abstract rows and find the first row with an actual value.
     """
-    if stmt is None:
+    if df is None or not period_cols or period >= len(period_cols):
         return 0.0
+    col = period_cols[period]
+
+    # Pre-compute a prefix-stripped version of the concept column once
+    stripped_concept = None
+    if "concept" in df.columns:
+        stripped_concept = df["concept"].str.replace(r"^[^_]+_", "", regex=True)
 
     for alias in aliases:
-        try:
-            # pandas DataFrame: rows are line items
-            import pandas as pd
-            if isinstance(stmt, pd.DataFrame):
-                # Try exact index match
-                if alias in stmt.index:
-                    val = stmt.loc[alias].iloc[period] if hasattr(stmt.loc[alias], 'iloc') else stmt.loc[alias, stmt.columns[period]]
-                    if val is not None and str(val) not in ("nan", "None", ""):
-                        return float(val)
-                # Try case-insensitive partial match
-                matches = stmt.index[stmt.index.str.contains(alias, case=False, na=False, regex=False)]
-                if len(matches) > 0:
-                    val = stmt.loc[matches[0]].iloc[period] if hasattr(stmt.loc[matches[0]], 'iloc') else stmt.loc[matches[0], stmt.columns[period]]
-                    if val is not None and str(val) not in ("nan", "None", ""):
-                        return float(val)
-        except Exception:
-            pass
+        # 1. Exact match on stripped concept (e.g. "NetCashProvidedByUsedInOperatingActivities")
+        if stripped_concept is not None:
+            mask = stripped_concept == alias
+            if mask.any():
+                for idx in mask[mask].index:
+                    val = _coerce(df.loc[idx, col])
+                    if val != 0.0:
+                        return val
 
-        try:
-            # Dict-like or custom Statement object
-            val = stmt[alias]
-            if hasattr(val, '__iter__') and not isinstance(val, (str, bytes)):
-                items = list(val)
-                if period < len(items):
-                    v = items[period]
-                    if v is not None:
-                        return float(v)
-            elif val is not None:
-                return float(val)
-        except Exception:
-            pass
+        # 2. Substring match on original concept / standard_concept / label
+        for search_col in ("concept", "standard_concept", "label"):
+            if search_col not in df.columns:
+                continue
+            try:
+                mask = df[search_col].str.contains(alias, case=False, na=False, regex=False)
+                if mask.any():
+                    for idx in mask[mask].index:
+                        val = _coerce(df.loc[idx, col])
+                        if val != 0.0:
+                            return val
+            except Exception:
+                pass
 
     return 0.0
 
 
+def _coerce(val) -> float:
+    """Convert a raw cell value to float, returning 0.0 on failure or NaN."""
+    if val is None:
+        return 0.0
+    try:
+        if isinstance(val, (int, float)):
+            f = float(val)
+            return 0.0 if f != f else f  # NaN → 0
+        s = str(val).replace(",", "").replace("$", "").strip()
+        return 0.0 if s in ("", "nan", "None", "NaN", "-", "—") else float(s)
+    except Exception:
+        return 0.0
+
+
+def _year_label(period_cols: list, period: int) -> str:
+    """Extract 4-digit year from a column name like '2024-09-28 (FY)'."""
+    if not period_cols or period >= len(period_cols):
+        return str(period)
+    m = re.search(r"(\d{4})", period_cols[period])
+    return m.group(1) if m else period_cols[period]
+
+
+# ── Adapter functions — convert YearData to metric input objects ───────────────
+
 def year_data_to_beneish_inputs(current: YearData, prior: YearData):
-    """Convert two YearData objects into BeneishInputs."""
     from src.metrics.beneish import BeneishInputs
     return BeneishInputs(
         net_receivables_t=current.receivables, sales_t=current.sales, cogs_t=current.cogs,
@@ -275,7 +288,6 @@ def year_data_to_beneish_inputs(current: YearData, prior: YearData):
 
 
 def year_data_to_altman_inputs(current: YearData):
-    """Convert a YearData object into AltmanInputs."""
     from src.metrics.altman import AltmanInputs
     return AltmanInputs(
         working_capital=current.current_assets - current.current_liabilities,
@@ -289,7 +301,6 @@ def year_data_to_altman_inputs(current: YearData):
 
 
 def year_data_to_sloan_inputs(current: YearData, prior: YearData):
-    """Convert two YearData objects into SloanInputs."""
     from src.metrics.sloan import SloanInputs
     return SloanInputs(
         net_income=current.net_income,
@@ -301,7 +312,6 @@ def year_data_to_sloan_inputs(current: YearData, prior: YearData):
 
 
 def year_data_to_piotroski_inputs(current: YearData, prior: YearData):
-    """Convert two YearData objects into PiotroskiInputs."""
     from src.metrics.piotroski import PiotroskiInputs
     return PiotroskiInputs(
         net_income=current.net_income,

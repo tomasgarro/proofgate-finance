@@ -27,6 +27,9 @@ import sys
 from datetime import date
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()  # reads .env into os.environ before anything else runs
+
 # ── Thresholds — tune to taste ────────────────────────────────────────────────
 M_FLAG       = -2.22   # Beneish above this → manipulation risk (academic cutoff)
 M_STRICT     = -1.78   # stricter version used in article's script
