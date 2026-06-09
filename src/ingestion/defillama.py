@@ -104,9 +104,18 @@ def get_protocol_metrics(slug: str) -> ProtocolMetrics:
     revenue_data = _fetch_safe(f"{_BASE}/summary/fees/{slug}?dataType=dailyRevenue")
 
     name = protocol_data.get("name", slug)
-    tvl = protocol_data.get("tvl", 0.0) or 0.0
-    tvl_change_1d = protocol_data.get("change_1d", 0.0) or 0.0
-    tvl_change_7d = protocol_data.get("change_7d", 0.0) or 0.0
+    # "tvl" in the protocol endpoint is a list of {date, totalLiquidityUSD} objects,
+    # not a scalar. Use the last entry for current TVL, or sum currentChainTvls.
+    tvl_raw = protocol_data.get("tvl", [])
+    if isinstance(tvl_raw, list) and tvl_raw:
+        tvl = float(tvl_raw[-1].get("totalLiquidityUSD", 0) or 0)
+    elif isinstance(tvl_raw, (int, float)):
+        tvl = float(tvl_raw)
+    else:
+        chain_tvls = protocol_data.get("currentChainTvls", {})
+        tvl = float(sum(v for v in chain_tvls.values() if isinstance(v, (int, float))))
+    tvl_change_1d = float(protocol_data.get("change_1d") or 0.0)
+    tvl_change_7d = float(protocol_data.get("change_7d") or 0.0)
     chains = list(protocol_data.get("chains", []))
     category = protocol_data.get("category", "")
 
